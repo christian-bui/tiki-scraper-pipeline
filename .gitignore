@@ -1,11 +1,15 @@
 # Bỏ qua môi trường ảo (Mỗi máy tự cài riêng, không đẩy lên mạng)
 env/
 
+# CHỐT CHẶN MỚI: Bỏ qua toàn bộ thư mục chứa data phân vùng (Rất quan trọng)
+output/
+
 # Bỏ qua dữ liệu thô (Git sinh ra để lưu code, không lưu data)
 *.csv
 *.json
 
-# Bỏ qua các file log báo cáo lắt nhắt
+# Bỏ qua các file log (Chặn pipeline.log và các file log cũ)
+*.log
 scraping_report.txt
 error_report.txt
 

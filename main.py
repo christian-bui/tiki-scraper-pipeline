@@ -1,184 +1,211 @@
 import asyncio
 import csv
-import glob
 import json
-import os
+import logging
 import random
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
 
-# --- CẤU HÌNH ---
+# --- PIPELINE CONFIGURATION ---
 CHUNK_SIZE = 1000
 SEMAPHORE_LIMIT = 50
 TIMEOUT_SECONDS = 15
-ORIGINAL_CSV = "products-0-200000.csv"
+INPUT_FILE = "products-0-200000.csv"
+OUTPUT_ROOT = Path("output/raw")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-]
+# Quyết định version tại một nơi duy nhất
+API_VERSION = "v2"
+API_BASE_URL = f"https://api.tiki.vn/product-detail/api/{API_VERSION}/products"
+
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("pipeline.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 
-def clean_description(html_content):
-    if not html_content:
-        return ""
-    soup = BeautifulSoup(html_content, "html.parser")
-    return soup.get_text(separator=" ", strip=True)
+class TikiPipeline:
+    """
+    Asynchronous ETL pipeline for large-scale Tiki product extraction.
+    Implements: Data Lineage (API versioning), Concurrency, and Partitioning.
+    """
 
+    def __init__(self):
+        self.semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+        self.daily_path = self._initialize_partition()
+        self.daily_path.mkdir(parents=True, exist_ok=True)
 
-# BÁO CÁO TIẾN ĐỘ TỪNG LÔ
-def log_chunk_completion(chunk_index, success_count, log_file="scraping_report.txt"):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(
-            f"[{now}] Lô {chunk_index}: Tải xong {success_count} sản phẩm thành công.\n"
+    def _initialize_partition(self) -> Path:
+        """Generates partitioned structure including API version: output/raw/api_v2/year=..."""
+        now = datetime.now()
+        # Thêm API_VERSION vào cấu trúc thư mục Data Lake
+        return (
+            OUTPUT_ROOT
+            / f"api_{API_VERSION}"
+            / f"year={now.year}"
+            / f"month={now.strftime('%m')}"
+            / f"day={now.strftime('%d')}"
         )
 
+    def clean_html(self, html: str) -> str:
+        """Extracts plain text from raw HTML content using BeautifulSoup."""
+        if not html:
+            return ""
+        return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
-async def fetch_product(session, product_id, semaphore):
-    url = f"https://api.tiki.vn/product-detail/api/v1/products/{product_id}"
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    async with semaphore:
+    async def fetch_product(
+        self, session: aiohttp.ClientSession, pid: str, retries: int = 3
+    ) -> Dict[str, Any]:
+        """Fetches and normalizes product detail from Tiki API."""
+        url = f"{API_BASE_URL}/{pid}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        last_error = "Unknown Error"
+
+        async with self.semaphore:
+            for attempt in range(retries):
+                try:
+                    async with session.get(
+                        url, headers=headers, timeout=TIMEOUT_SECONDS
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+
+                            # Validation: Ensure critical data exists
+                            if not data.get("name") or data.get("price") is None:
+                                return {
+                                    "id": pid,
+                                    "status": "FAILED",
+                                    "error": "200 OK but Missing Name/Price",
+                                    "version": API_VERSION,
+                                }
+
+                            return {
+                                "id": pid,
+                                "status": "SUCCESS",
+                                "data": {
+                                    # Data Lineage: Gắn mã nguồn vào từng record
+                                    "source_api_version": API_VERSION,
+                                    "scraped_at": datetime.now().isoformat(),
+                                    # Extracted Fields
+                                    "id": data.get("id"),
+                                    "sku": data.get("sku"),
+                                    "name": data.get("name"),
+                                    "brand_name": data.get("brand", {}).get("name"),
+                                    "price": data.get("price"),
+                                    "list_price": data.get("list_price"),
+                                    "discount_rate": data.get("discount_rate"),
+                                    "rating": data.get("rating_average"),
+                                    "reviews": data.get("review_count"),
+                                    "inventory_status": data.get("inventory_status"),
+                                    "categories": [
+                                        b.get("name")
+                                        for b in data.get("breadcrumbs", [])
+                                    ],
+                                    "description": self.clean_html(
+                                        data.get("description")
+                                    ),
+                                    "images": [
+                                        img.get("base_url")
+                                        for img in data.get("images", [])
+                                    ],
+                                },
+                            }
+
+                        elif resp.status == 404:
+                            logger.warning(
+                                f"Product {pid} not found (404) on {API_VERSION}"
+                            )
+                            return {
+                                "id": pid,
+                                "status": "FAILED",
+                                "error": "404 Not Found",
+                                "version": API_VERSION,
+                            }
+
+                        else:
+                            last_error = f"HTTP {resp.status}"
+                            resp.raise_for_status()
+
+                except asyncio.TimeoutError:
+                    last_error = "Timeout Error"
+                except aiohttp.ClientResponseError as e:
+                    last_error = f"HTTP Error {e.status}"
+                except Exception as e:
+                    last_error = f"Network/System Exception: {str(e)}"
+
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        return {
+            "id": pid,
+            "status": "FAILED",
+            "error": f"Max retries reached. Last issue: {last_error}",
+            "version": API_VERSION,
+        }
+
+    async def run(self, limit: Optional[int] = None):
+        """Orchestrates the scraping process in batches."""
         try:
-            async with session.get(
-                url, headers=headers, timeout=TIMEOUT_SECONDS
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    name, price = data.get("name"), data.get("price")
-                    if not name or price is None:
-                        return {
-                            "id": product_id,
-                            "error": "Thiếu Tên/Giá",
-                            "type": "DATA_ISSUE",
-                        }
-                    return {
-                        "status": "SUCCESS",
-                        "data": {
-                            "id": data.get("id"),
-                            "name": name,
-                            "price": price,
-                            "description": clean_description(data.get("description")),
-                            "images_url": [
-                                img.get("base_url") for img in data.get("images", [])
-                            ],
-                        },
+            with open(INPUT_FILE, mode="r", encoding="utf-8") as f:
+                all_ids = [row["id"] for row in csv.DictReader(f)]
+        except FileNotFoundError:
+            logger.error(f"Source file {INPUT_FILE} missing.")
+            return
+
+        if limit:
+            all_ids = all_ids[:limit]
+            logger.info(f"TEST MODE: {limit} IDs on {API_VERSION}")
+
+        total = len(all_ids)
+        logger.info(f"Starting pipeline. Total: {total} | API: {API_VERSION}")
+
+        async with aiohttp.ClientSession() as session:
+            for i in range(0, total, CHUNK_SIZE):
+                batch_ids = all_ids[i : i + CHUNK_SIZE]
+                tasks = [self.fetch_product(session, pid) for pid in batch_ids]
+                results = await asyncio.gather(*tasks)
+
+                success_batch = [r["data"] for r in results if r["status"] == "SUCCESS"]
+                failed_batch = [
+                    {
+                        "id": r["id"],
+                        "api_version": r.get("version"),
+                        "error": r["error"],
                     }
-                return {
-                    "id": product_id,
-                    "error": f"HTTP {response.status}",
-                    "type": "SERVER_ERROR",
-                }
-        except Exception as e:
-            return {"id": product_id, "error": str(e), "type": "NETWORK_ISSUE"}
+                    for r in results
+                    if r["status"] == "FAILED"
+                ]
 
+                self._persist_batch(i // CHUNK_SIZE + 1, success_batch, failed_batch)
+                logger.info(
+                    f"Progress: {min(i + CHUNK_SIZE, total)}/{total} processed."
+                )
 
-async def process_and_save_chunk(session, chunk_ids, chunk_index, semaphore):
-    tasks = [fetch_product(session, pid, semaphore) for pid in chunk_ids]
-    results = await asyncio.gather(*tasks)
-    success_data = [
-        res["data"] for res in results if res and res.get("status") == "SUCCESS"
-    ]
-    failed_ids = [
-        res["id"] for res in results if not res or res.get("status") != "SUCCESS"
-    ]
+    def _persist_batch(self, batch_idx: int, success: list, failed: list):
+        """Saves batch results to disk."""
+        if success:
+            output_file = self.daily_path / f"batch_{batch_idx}.json"
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(success, f, ensure_ascii=False, indent=4)
 
-    if success_data:
-        with open(f"tiki_products_part_{chunk_index}.json", "w", encoding="utf-8") as f:
-            json.dump(success_data, f, ensure_ascii=False, indent=4)
-        log_chunk_completion(
-            chunk_index, len(success_data)
-        )  # Ghi file txt báo cáo tiến độ
-
-    print(f"-> Part {chunk_index}: Xong {len(success_data)} SP | Lỗi {len(failed_ids)}")
-    return failed_ids
-
-
-# BÁO CÁO TỔNG KẾT CUỐI CÙNG (DEDUPLICATE + FAILED CSV)
-def final_consolidation(original_ids):
-    print("\n[BÁO CÁO TỔNG KẾT] Đang xử lý dữ liệu cuối cùng...")
-    file_list = glob.glob("tiki_products_part_*.json")
-    if os.path.exists("tiki_products_retry_success.json"):
-        file_list.append("tiki_products_retry_success.json")
-
-    unique_products = {}
-
-    def get_score(p):
-        return sum(1 for v in p.values() if v)
-
-    for filename in file_list:
-        with open(filename, "r", encoding="utf-8") as f:
-            for item in json.load(f):
-                pid = str(item["id"])
-                if pid not in unique_products or get_score(item) >= get_score(
-                    unique_products[pid]
-                ):
-                    unique_products[pid] = item
-
-    # 1. Lưu file JSON sạch
-    final_data = list(unique_products.values())
-    with open("tiki_products_FINAL.json", "w", encoding="utf-8") as f:
-        json.dump(final_data, f, ensure_ascii=False, indent=4)
-
-    # 2. Tìm và xuất file CSV các ID thất bại
-    success_ids = set(unique_products.keys())
-    failed_to_download = [pid for pid in original_ids if pid not in success_ids]
-
-    with open("failed_products.csv", "w", encoding="utf-8") as f:
-        f.write("id\n")
-        for pid in failed_to_download:
-            f.write(f"{pid}\n")
-
-    print("-" * 30)
-    print("TỔNG KẾT:")
-    print(f"- Tổng ID gốc: {len(original_ids)}")
-    print(f"- Tổng ID tải thành công: {len(final_data)}")
-    print(f"- Tổng ID thất bại: {len(failed_to_download)}")
-    print("-> File sạch: tiki_products_FINAL.json")
-    print("-> File lỗi: failed_products.csv")
-    print("-" * 30)
-
-
-async def main():
-    all_ids = []
-    with open(ORIGINAL_CSV, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        all_ids = [row["id"] for row in reader]
-
-    total = len(all_ids)
-    semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
-    all_failed_ids = []
-
-    async with aiohttp.ClientSession() as session:
-        for i in range(0, total, CHUNK_SIZE):
-            chunk, idx = all_ids[i : i + CHUNK_SIZE], (i // CHUNK_SIZE) + 1
-            if os.path.exists(f"tiki_products_part_{idx}.json"):
-                continue
-
-            f_ids = await process_and_save_chunk(session, chunk, idx, semaphore)
-            all_failed_ids.extend(f_ids)
-            await asyncio.sleep(1)
-
-        if all_failed_ids:
-            # Chạy lại đợt 2 cho các ID lỗi
-            tasks = [fetch_product(session, pid, semaphore) for pid in all_failed_ids]
-            r_results = await asyncio.gather(*tasks)
-            r_success = [
-                res["data"]
-                for res in r_results
-                if res and res.get("status") == "SUCCESS"
-            ]
-            if r_success:
-                with open(
-                    "tiki_products_retry_success.json", "w", encoding="utf-8"
-                ) as f:
-                    json.dump(r_success, f, ensure_ascii=False, indent=4)
-
-    final_consolidation(all_ids)
+        if failed:
+            fail_log = self.daily_path / "all_failed_ids.csv"
+            exists = fail_log.exists()
+            with open(fail_log, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "api_version", "error"])
+                if not exists:
+                    writer.writeheader()
+                writer.writerows(failed)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    pipeline = TikiPipeline()
+    # Chạy thật: Sửa thành limit=None
+    asyncio.run(pipeline.run(limit=None))
