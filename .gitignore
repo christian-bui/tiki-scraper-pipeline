@@ -1,0 +1,14 @@
+# Bỏ qua môi trường ảo (Mỗi máy tự cài riêng, không đẩy lên mạng)
+env/
+
+# Bỏ qua dữ liệu thô (Git sinh ra để lưu code, không lưu data)
+*.csv
+*.json
+
+# Bỏ qua các file log báo cáo lắt nhắt
+scraping_report.txt
+error_report.txt
+
+# Bỏ qua rác hệ thống của Python
+__pycache__/
+*.pyc
