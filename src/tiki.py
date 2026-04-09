@@ -1,6 +1,6 @@
 """
-Main pipeline to scrape product data from Tiki API.
-It extracts data, cleans it, and saves it to JSON and CSV files safely.
+Core Engine: Tiki Pipeline.
+Provides the class and methods to scrape, validate, and store Tiki products.
 """
 
 import asyncio
@@ -10,51 +10,49 @@ import logging
 import random
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Set
 
 import aiohttp
 
-# Import configuration and utility modules
+# Import natively without sys.path hacks because main.py runs from the root
 from config import (
     API_BASE_URL,
     API_VERSION,
     BATCH_DELAY,
     CHUNK_SIZE,
-    INPUT_FILE,
-    LIMIT,
     OUTPUT_ROOT,
     SEMAPHORE_LIMIT,
     TIMEOUT_SECONDS,
 )
-from utils import clean_html
+from src.utils import clean_html
 
-# Setup logging to print messages to the terminal and save them to a file
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("pipeline.log"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
+
+# Determine ROOT_DIR cleanly based on this file's absolute position
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 class TikiPipeline:
     """Class to manage the web scraping process."""
 
     def __init__(self):
-        """Set up the pipeline and limit the number of parallel tasks."""
         self.semaphore = asyncio.Semaphore(SEMAPHORE_LIMIT)
+
         self.daily_path = self._initialize_partition()
         self.daily_path.mkdir(parents=True, exist_ok=True)
 
-        # Define paths for tracking files
-        self.success_log = self.daily_path / "success_ids.txt"
+        self.global_api_path = ROOT_DIR / OUTPUT_ROOT / f"api_{API_VERSION}"
+        self.global_api_path.mkdir(parents=True, exist_ok=True)
+
+        self.success_log = self.global_api_path / "success_ids.txt"
         self.fail_log = self.daily_path / "all_failed_ids.csv"
 
-    def _initialize_partition(self):
-        """Create a folder path based on the current date (e.g., day=06)."""
+    def _initialize_partition(self) -> Path:
         now = datetime.now()
         return (
-            OUTPUT_ROOT
+            ROOT_DIR
+            / OUTPUT_ROOT
             / f"api_{API_VERSION}"
             / f"year={now.year}"
             / f"month={now.strftime('%m')}"
@@ -62,16 +60,11 @@ class TikiPipeline:
         )
 
     def _get_processed_ids(self) -> Set[str]:
-        """Find all product IDs that are already saved using lightweight text files to save RAM."""
         processed = set()
-
-        # 1. Read successful IDs from a simple text file (O(1) memory overhead)
         if self.success_log.exists():
             with open(self.success_log, "r", encoding="utf-8") as f:
-                # Strip spaces and empty lines
                 processed.update(line.strip() for line in f if line.strip())
 
-        # 2. Read failed IDs from CSV file
         if self.fail_log.exists():
             try:
                 with open(self.fail_log, "r", encoding="utf-8") as f:
@@ -79,18 +72,12 @@ class TikiPipeline:
                         processed.add(str(row["id"]))
             except (csv.Error, IOError):
                 pass
-
         return processed
 
     async def fetch_product(
         self, session: aiohttp.ClientSession, pid: str, retries: int = 3
     ) -> Dict[str, Any]:
-        """
-        Get product data from Tiki API.
-        It must have at least 2 valid fields to be a SUCCESS.
-        """
         url = f"{API_BASE_URL}/{pid}"
-
         headers = {
             "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.randint(115, 123)}.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -111,7 +98,6 @@ class TikiPipeline:
                         if resp.status == 200:
                             data = await resp.json()
 
-                            # Extract fields
                             p_id = data.get("id")
                             raw_name = data.get("name")
                             name = (
@@ -141,9 +127,7 @@ class TikiPipeline:
                                 description,
                                 images_url,
                             ]
-                            valid_count = sum(1 for item in check_list if item)
-
-                            if valid_count >= 2:
+                            if sum(1 for item in check_list if item) >= 2:
                                 return {
                                     "id": pid,
                                     "status": "SUCCESS",
@@ -157,12 +141,11 @@ class TikiPipeline:
                                         "scraped_at": datetime.now().isoformat(),
                                     },
                                 }
-                            else:
-                                return {
-                                    "id": pid,
-                                    "status": "FAILED",
-                                    "error": "DATA_TOO_SPARSE",
-                                }
+                            return {
+                                "id": pid,
+                                "status": "FAILED",
+                                "error": "DATA_TOO_SPARSE",
+                            }
 
                         elif resp.status == 404:
                             return {
@@ -177,7 +160,6 @@ class TikiPipeline:
                             last_error_msg = f"HTTP_{resp.status}"
                             resp.raise_for_status()
 
-                # FIX: Catch only network-related errors, do NOT swallow logic bugs
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_error_msg = type(e).__name__
                     await asyncio.sleep(random.uniform(1, 3))
@@ -189,23 +171,15 @@ class TikiPipeline:
         }
 
     def _get_next_batch_index(self) -> int:
-        """Find the highest file number and return the next one."""
         files = list(self.daily_path.glob("batch_*.json"))
         indices = [int(f.stem.split("_")[1]) for f in files if "_" in f.stem]
         return max(indices) + 1 if indices else 1
 
     def _persist_batch_sync(self, batch_idx: int, success: list, failed: list):
-        """
-        Synchronous function to save data.
-        It runs in a separate thread so it does not block the async event loop.
-        """
         if success:
-            # 1. Save full JSON data
             output_file = self.daily_path / f"batch_{batch_idx}.json"
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(success, f, ensure_ascii=False, indent=4)
-
-            # 2. Append IDs to text file for fast RAM-free reading later
             with open(self.success_log, "a", encoding="utf-8") as f:
                 f.write("\n".join(str(item["id"]) for item in success) + "\n")
 
@@ -218,7 +192,6 @@ class TikiPipeline:
                 writer.writerows(failed)
 
     async def run(self, ids_to_run: List[str], is_retry_phase: bool = False):
-        """Run the scraping pipeline for a list of IDs."""
         total = len(ids_to_run)
         if total == 0:
             return
@@ -233,7 +206,6 @@ class TikiPipeline:
         async with aiohttp.ClientSession() as session:
             for i in range(0, total, CHUNK_SIZE):
                 batch_ids = ids_to_run[i : i + CHUNK_SIZE]
-
                 tasks = [self.fetch_product(session, pid) for pid in batch_ids]
                 results = await asyncio.gather(*tasks)
 
@@ -247,7 +219,6 @@ class TikiPipeline:
                 cumulative_success += len(success)
                 cumulative_failed += len(failed)
 
-                # FIX: Send heavy file writing to a background thread to keep Async fast
                 await asyncio.to_thread(
                     self._persist_batch_sync,
                     start_idx + (i // CHUNK_SIZE),
@@ -263,59 +234,11 @@ class TikiPipeline:
                     cumulative_success,
                     cumulative_failed,
                 )
-
                 await asyncio.sleep(BATCH_DELAY)
 
         logger.info(
-            "PHASE_SUMMARY | %s IS COMPLETED | FINAL_TOTAL_SUCCESS: %d | FINAL_TOTAL_FAILED: %d",
+            "PHASE_SUMMARY | %s IS COMPLETED | FINAL_SUCCESS: %d | FINAL_FAILED: %d",
             phase,
             cumulative_success,
             cumulative_failed,
         )
-
-
-async def main():
-    """Main execution function."""
-    pipeline = TikiPipeline()
-
-    try:
-        with open(INPUT_FILE, mode="r", encoding="utf-8-sig") as f:
-            all_ids = list(dict.fromkeys([row["id"] for row in csv.DictReader(f)]))
-    except FileNotFoundError:
-        logger.error("IO_ERROR: Input file %s not found.", INPUT_FILE)
-        return
-
-    processed = pipeline._get_processed_ids()
-    remaining = [pid for pid in all_ids if str(pid) not in processed]
-
-    if LIMIT is not None:
-        remaining = remaining[:LIMIT]
-        logger.info("MODE_TEST: Applied limit of %d IDs", LIMIT)
-
-    # 1. RUN MAIN PHASE
-    if remaining:
-        await pipeline.run(remaining)
-    else:
-        logger.info("CHECKPOINT: All IDs processed in Main Phase.")
-
-    # 2. RUN RETRY PHASE
-    logger.info("INITIATING_RETRY_SCAN")
-
-    # FIX: Rename the file to create a safe backup instead of deleting it
-    if pipeline.fail_log.exists():
-        backup_log = pipeline.daily_path / "all_failed_ids_old.csv"
-        pipeline.fail_log.rename(backup_log)
-
-        with open(backup_log, "r", encoding="utf-8") as f:
-            failed_list = [
-                row["id"] for row in csv.DictReader(f) if "404" not in row["error"]
-            ]
-
-        if failed_list:
-            await pipeline.run(failed_list, is_retry_phase=True)
-
-    logger.info("PIPELINE_COMPLETELY_FINISHED")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

@@ -1,18 +1,61 @@
-# Bỏ qua môi trường ảo (Mỗi máy tự cài riêng, không đẩy lên mạng)
+# ==============================================================================
+# ENVIRONMENTS
+# ==============================================================================
+# Ignore local virtual environments (Each user should install their own)
 env/
+venv/
+.env
 
-# CHỐT CHẶN MỚI: Bỏ qua toàn bộ thư mục chứa data phân vùng (Rất quan trọng)
-output/
+# ==============================================================================
+# PYTHON SYSTEM FILES
+# ==============================================================================
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Bỏ qua dữ liệu thô (Git sinh ra để lưu code, không lưu data)
-*.csv
-*.json
-
-# Bỏ qua các file log (Chặn pipeline.log và các file log cũ)
+# ==============================================================================
+# LOGS & TEMPORARY FILES
+# ==============================================================================
+# Ignore all execution logs and reports
 *.log
+pipeline.log
 scraping_report.txt
 error_report.txt
 
-# Bỏ qua rác hệ thống của Python
-__pycache__/
-*.pyc
+# ==============================================================================
+# DATA HANDLING (CRITICAL)
+# ==============================================================================
+# By default, ignore all JSON and CSV files to prevent large data uploads
+*.json
+*.csv
+
+# Also ignore the entire output folder
+output/
+
+# ------------------------------------------------------------------------------
+# EXCEPTIONS: Explicitly allow only the necessary files for handover
+# ------------------------------------------------------------------------------
+
+# 1. Allow the original target product list
+!products-0-200000.csv
+
+# 2. Allow the final audit results
+!frontend_audit_results.csv
+
+# 3. Allow the specific failure log from Day 09 (Round 15)
+# To allow a deep file, we must tell Git to look into the parent folders
+!output/
+!output/raw/
+!output/raw/api_v2/
+!output/raw/api_v2/year=2026/
+!output/raw/api_v2/year=2026/month=04/
+!output/raw/api_v2/year=2026/month=04/day=09/
+!output/raw/api_v2/year=2026/month=04/day=09/retry_failed_aio_15.csv
+
+# ==============================================================================
+# OS SPECIFIC FILES
+# ==============================================================================
+.DS_Store
+Thumbs.db

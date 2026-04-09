@@ -4,11 +4,12 @@
 
 echo "Starting Tiki Supervisor..."
 
-# Kích hoạt môi trường ảo tự động để tránh lỗi thiếu thư viện
+# Activate virtual environment
 source env/bin/activate
 
 while true; do
-    python3 tiki.py
+    # Chạy vô lăng chính ở thư mục gốc
+    python3 main.py
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -eq 0 ]; then
